@@ -1,0 +1,10 @@
+[package]
+name = "tengas"
+version = "0.1.0"
+authors = ["Tal Levy <jubboy333@gmail.com>"]
+
+[dependencies]
+hyper = "*"
+
+[dependencies.mio]
+git = "https://github.com/carllerche/mio"
