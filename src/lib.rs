@@ -1,5 +1,5 @@
 #![allow(unused_must_use, dead_code, unused_variables)]
-#![feature(fnbox)]
+#![feature(lookup_host, fnbox)]
 
 extern crate mio;
 extern crate hyper;
@@ -9,10 +9,9 @@ mod http;
 use http::HttpStream; 
 
 use std::thread;
-use std::net::ToSocketAddrs;
+use std::net::{self, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use std::io;
-use std::io::Read;
+use std::io::{self, Read};
 use std::boxed::FnBox;
 
 use mio::{Sender, EventSet, PollOpt, Token, EventLoop, Handler};
@@ -32,7 +31,13 @@ type Callback = Box<FnBox(String) + Send + 'static>;
 type RequestAndCallback = (Request, Callback);
 
 struct Request {
-    url: Url
+    url: Url,
+    addr: SocketAddr
+}
+
+enum Message {
+    Req(RequestAndCallback),
+    Shutdown
 }
 
 struct Connection {
@@ -62,9 +67,27 @@ impl ResponseManager {
     }
 }
 
+fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
+    let ips = try!(net::lookup_host(host));
+    let v: Vec<_> = try!(ips.map(|a| {
+        a.map(|a| {
+            match a {
+                SocketAddr::V4(ref a) => {
+                    SocketAddr::V4(SocketAddrV4::new(*a.ip(), port))
+                }
+                SocketAddr::V6(ref a) => {
+                    SocketAddr::V6(SocketAddrV6::new(*a.ip(), port, a.flowinfo(), a.scope_id()))
+                }
+            }
+        })
+    }).collect());
+
+    Ok(v[0])
+}
+
 impl Handler for ResponseManager {
     type Timeout = usize;
-    type Message = RequestAndCallback;
+    type Message = Message;
 
     fn ready(&mut self, event_loop: &mut EventLoop<ResponseManager>, token: Token, event: EventSet) {
         if event.is_hup() {
@@ -110,42 +133,36 @@ impl Handler for ResponseManager {
         }
     }
 
-    fn notify(&mut self, event_loop: &mut EventLoop<ResponseManager>, msg: RequestAndCallback) {
-        let (request, callback) = msg;
+    fn notify(&mut self, event_loop: &mut EventLoop<ResponseManager>, msg: Message) {
+        match msg {
+            Message::Req((request, callback)) => {
+                match self.conns.insert_with(|token| {
+                    let (sock, _) = TcpSocket::v4().unwrap().connect(&request.addr).unwrap();
+                    let boxed_sock = Box::new(HttpStream(sock));
 
-        if request.url.domain().unwrap_or("shutdown") == "shutdown" {
-            event_loop.shutdown();
-            return;
-        }
-
-        match self.conns.insert_with(|token| {
-            // hack because mio::TcpStream does not implement ToSocketAddrs (private in std)
-            let url = request.url.clone();
-            let addr_str = (url.domain().unwrap_or("localhost"), url.port().unwrap_or(80));
-            let addr = addr_str.to_socket_addrs().ok().map(|x| { x.into_iter().next().unwrap() }).unwrap();
-            let (sock, _) = TcpSocket::v4().unwrap().connect(&addr).unwrap();
-            let boxed_sock = Box::new(HttpStream(sock));
-
-            Connection {
-                url: request.url.clone(),
-                token: token,
-                stream: boxed_sock,
-                callback: callback
+                    Connection {
+                        url: request.url.clone(),
+                        token: token,
+                        stream: boxed_sock,
+                        callback: callback
+                    }
+                }) {
+                    Some(token) => {
+                        let conn = self.find_connection_by_token(token);
+                        event_loop.register_opt(&conn.stream.0, token, EventSet::writable() | EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                    },
+                    None => {
+                        event_loop.shutdown();
+                    }
+                }
             }
-        }) {
-            Some(token) => {
-                let conn = self.find_connection_by_token(token);
-                event_loop.register_opt(&conn.stream.0, token, EventSet::writable() | EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-            },
-            None => {
-                event_loop.shutdown();
-            }
+            Message::Shutdown => { event_loop.shutdown(); }
         }
     }
 }
 
 struct Client {
-    sender: Arc<Sender<RequestAndCallback>>
+    sender: Arc<Sender<Message>>
 }
 
 impl Client {
@@ -165,20 +182,21 @@ impl Client {
 
     fn get(&mut self, surl: &str, callback: Callback) {
         let url = Url::parse(surl).ok().expect("failed parsing surl");
+        let addr = resolve_host(url.domain().unwrap_or("localhost"), url.port().unwrap_or(80));
 
         let r = Request {
-            url: url
+            url: url,
+            addr: addr.ok().expect("unable to resolve host")
         };
 
-        self.sender.send((r, callback));
+        self.sender.send(Message::Req((r, callback)));
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
         // TODO: wait for event_loop to stop running before exiting
-        let f = Box::new(move |r: String| { });
-        self.sender.send((Request { url: Url::parse("http://shutdown/").ok().expect("FD") }, f));
+        self.sender.send(Message::Shutdown);
     }
 }
 
@@ -186,10 +204,12 @@ impl Drop for Client {
 fn it_works() {
     let mut client = Client::new().ok().expect("unable to start client");
 
-    for _ in 0..10 {
-        let cb = Box::new(move|response: String| { println!("{}", response) });
-        client.get("http://httpbin.org/get", cb)
-    }
+    let cb = Box::new(move|response: String| { println!("1") });
+    client.get("http://www.google.com/", cb);
+    let cb = Box::new(move|response: String| { println!("2") });
+    client.get("http://www.google.com/", cb);
+    let cb = Box::new(move|response: String| { println!("3") });
+    client.get("http://www.google.com/", cb);
 
     thread::sleep_ms(1000);
 }
